@@ -52,15 +52,15 @@ const float CALIBRATION_FACTOR = 480245.0;
 // ─────────────────────────────
 // SOIL
 // ─────────────────────────────fd
-#define SOIL_PIN 32
+#define SOIL_PIN 33
 #define SOIL_DRY 4095
 #define SOIL_WET 1200
 
 // ─────────────────────────────
 // FLOW SENSORS (interrupt-based)
 // ─────────────────────────────
-#define FLOW1_PIN 21
-#define FLOW2_PIN 22
+#define FLOW1_PIN 13
+#define FLOW2_PIN 12
 #define FLOW_CAL  450.0   // pulses per litre
 
 volatile long inputPulses = 0;
@@ -84,6 +84,34 @@ DFRobot_ECPRO_PT1000 ecpt;
 
 float ec_drainage   = 0.0;
 float temp_drainage = 0.0;
+
+// ─────────────────────────────
+// PH SENSOR
+// ─────────────────────────────
+const int PH_PIN = 32;
+
+// Calibration coefficients
+const float slope = -3.7;
+const float intercept = 16.15;
+
+float readPH() {
+  const int samples = 20;
+  long adcSum = 0;
+
+  for (int i = 0; i < samples; i++) {
+    adcSum += analogRead(PH_PIN);
+    delay(20);
+  }
+
+  float adcAverage = adcSum / (float)samples;
+
+  float voltage = adcAverage * 3.3 / 4095.0;
+
+  float pH = slope * voltage + intercept;
+
+  return pH;
+}
+
 
 // ─────────────────────────────
 // TIMING
@@ -110,10 +138,10 @@ void setup() {
   scale.begin(DOUT, CLK);
   scale.set_scale(CALIBRATION_FACTOR);
   scale.tare();
-  Serial.println("✅ Scale ready");
+  Serial.println("Scale ready");
 
   // ── EC sensor ───────────────────────────────
-  ec.setCalibration(0.961);
+  // ec.setCalibration(0.961);
 
   // ── Soil ────────────────────────────────────
   pinMode(SOIL_PIN, INPUT);
@@ -127,14 +155,14 @@ void setup() {
   // ── LoRa ────────────────────────────────────
   LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
   if (!LoRa.begin(LORA_BAND)) {
-    Serial.println("❌ LoRa init failed — halting");
+    Serial.println("LoRa init failed — halting");
     while (true);
   }
   LoRa.setSpreadingFactor(7);
   LoRa.setSignalBandwidth(125E3);
   LoRa.setCodingRate4(5);
   LoRa.setSyncWord(0x12);
-  Serial.println("✅ LoRa ready at 868 MHz");
+  Serial.println("LoRa ready at 868 MHz");
 }
 
 // ─────────────────────────────────────────────
@@ -155,7 +183,7 @@ void receiveLoRa() {
 
   // ── filter by device id ──────────────────────
   if (msg.indexOf("\"id\":\"" + DEVICE_ID + "\"") == -1) {
-    Serial.println("⏩ Ignored — not for " + DEVICE_ID);
+    Serial.println("Ignored — not for " + DEVICE_ID);
     return;
   }
 
@@ -164,26 +192,26 @@ void receiveLoRa() {
   if (msg.indexOf("\"pump\":1") >= 0) {
     pumpState = true;
     digitalWrite(RELAY_PIN, LOW);   // LOW = energise relay = pump ON
-    Serial.println("✅ Main pump ON");
+    Serial.println("Main pump ON");
   } else if (msg.indexOf("\"pump\":0") >= 0) {
     pumpState = false;
     digitalWrite(RELAY_PIN, HIGH);
-    Serial.println("🔴 Main pump OFF");
+    Serial.println("Main pump OFF");
   }
 
   // ── drain pump ───────────────────────────────
   if (msg.indexOf("\"drain_pump\":1") >= 0) {
     drainPumpState = true;
     digitalWrite(RELAY2_PIN, HIGH);
-    Serial.println("✅ Drain pump ON");
+    Serial.println("Drain pump ON");
   } else if (msg.indexOf("\"drain_pump\":0") >= 0) {
     drainPumpState = false;
     digitalWrite(RELAY2_PIN, LOW);
-    Serial.println("🔴 Drain pump OFF");
+    Serial.println("Drain pump OFF");
   }
 
   // ── RSSI for signal quality log ──────────────
-  Serial.println("📶 RSSI: " + String(LoRa.packetRssi()) + " dBm");
+  Serial.println("RSSI: " + String(LoRa.packetRssi()) + " dBm");
 }
 
 // ─────────────────────────────────────────────
@@ -221,25 +249,39 @@ void sendData() {
   // ── EC + Temperature (DFRobot library) ───────
   // Only meaningful when drainage is flowing
   if (drainage_mL > 0) {
-    delay(200); // let ADC settle
 
-    // Temperature from PT1000
-    uint16_t te_mv = (uint16_t)(analogRead(TE_PIN) * 3300UL / 4095);
-    temp_drainage = ecpt.convVoltagetoTemperature_C(te_mv / 1000.0);
+  const int samples = 20;
+  long adcSum = 0;
 
-    // EC with temperature compensation
-    uint16_t ec_mv = (uint16_t)(analogRead(EC_PIN) * 3300UL / 4095);
-    ec_drainage    = ec.getEC_us_cm(ec_mv, temp_drainage);
-  } else {
-    // No drainage yet — report 0
-    ec_drainage   = 0.0;
-    temp_drainage = 0.0;
+  for (int i = 0; i < samples; i++) {
+    adcSum += analogRead(EC_PIN);
+    delay(20);
   }
+
+  float adcAverage = adcSum / (float)samples;
+
+  float voltage = adcAverage * 3.3 / 4095.0;
+
+  temp_drainage = 25.0;
+
+  ec_drainage = ec.getEC_us_cm(voltage * 1000.0, temp_drainage);
+
+  ec_drainage *= 0.999;
+
+} else {
+
+  ec_drainage = 0.0;
+  temp_drainage = 0.0;
+
+}
+
+    float ph_value = readPH();
 
   // ── Build JSON — keys match Node-RED exactly ──
   String json = "{";
   json += "\"id\":\""          + DEVICE_ID                        + "\",";
   json += "\"weight_g\":"      + String((int)round(weight_g))     + ",";
+  json += "\"ph\":" + String(ph_value, 2) + ",";
   json += "\"soil_pct\":"      + String(soil_pct)                 + ",";
   json += "\"input_mL\":"      + String((int)round(input_mL))     + ",";
   json += "\"drainage_mL\":"   + String((int)round(drainage_mL))  + ",";
@@ -255,7 +297,7 @@ void sendData() {
   LoRa.println(json);
   LoRa.endPacket();
 
-  Serial.println("📤 LoRa TX: " + json);
+  Serial.println("LoRa TX: " + json);
   Serial.println("   weight:" + String((int)weight_g) +
                  "g soil:" + String(soil_pct) +
                  "% in:" + String((int)input_mL) +
