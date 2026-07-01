@@ -1,7 +1,19 @@
+// ═══════════════════════════════════════════════════════════════
+// IRRIGATION ESP32 — LoRa version (aligned with gateway + Node-RED)
+// FIX: receiveLoRa() called throughout sendData() to prevent
+//      missed commands during blocking sensor reads.
+// NEW: Deep sleep during "repos" (pump OFF) — wakes every 5 min
+//      to send telemetry. While pump is ON, deep sleep is
+//      disabled and the device stays fully awake/responsive
+//      (30s telemetry + continuous LoRa listening), exactly
+//      like before.
+// ═══════════════════════════════════════════════════════════════
+
 #include <SPI.h>
 #include <LoRa.h>
 #include "HX711.h"
 #include "DFRobot_ECPRO.h"
+#include "esp_sleep.h"
 
 // ─────────────────────────────
 // DEVICE ID
@@ -22,8 +34,13 @@ const String DEVICE_ID = "abdellah";
 #define RELAY_PIN  25
 #define RELAY2_PIN 4
 
-bool pumpState     = false;
-bool drainPumpState = false;
+// NOTE: RTC_DATA_ATTR keeps these values alive across deep sleep
+// (deep sleep wipes normal RAM but preserves RTC memory).
+RTC_DATA_ATTR bool  pumpState      = false;
+RTC_DATA_ATTR bool  drainPumpState = false;
+RTC_DATA_ATTR float input_mL       = 0.0;
+RTC_DATA_ATTR float drainage_mL    = 0.0;
+RTC_DATA_ATTR int   bootCount      = 0;
 
 // ─────────────────────────────
 // HX711
@@ -50,9 +67,6 @@ int SOIL_WET = 1200;
 volatile long inputPulses = 0;
 volatile long drainPulses = 0;
 
-float input_mL    = 0.0;
-float drainage_mL = 0.0;
-
 void IRAM_ATTR flow1ISR() { inputPulses++; }
 void IRAM_ATTR flow2ISR() { drainPulses++; }
 
@@ -69,13 +83,21 @@ float ec_drainage   = 0.0;
 float temp_drainage = 0.0;
 
 // ─────────────────────────────
-// TIMING
+// TIMING (active / irrigation mode)
 // ─────────────────────────────
 unsigned long lastSend = 0;
-const unsigned long SEND_INTERVAL_MS = 30000UL;
+const unsigned long SEND_INTERVAL_MS = 30000UL; // 30s while pump is ON
+
+// ─────────────────────────────
+// DEEP SLEEP (repos / resting mode)
+// ─────────────────────────────
+#define uS_TO_S_FACTOR 1000000ULL
+const uint64_t SLEEP_MINUTES     = 5;                                 // send data every 5 min while resting
+const uint64_t SLEEP_INTERVAL_US = SLEEP_MINUTES * 60ULL * uS_TO_S_FACTOR;
+const unsigned long LISTEN_WINDOW_MS = 3000UL; // brief LoRa listen right after wake-up
 
 // ═══════════════════════════════════════════════════════════════
-// PH — reduced delay: 20×2ms = 40ms (was 20×10ms = 200ms)
+// PH
 // ═══════════════════════════════════════════════════════════════
 const int    PH_PIN    = 32;
 const float  slope     = -3.7;
@@ -86,7 +108,7 @@ float readPH() {
   long sum = 0;
   for (int i = 0; i < samples; i++) {
     sum += analogRead(PH_PIN);
-    delay(2);                  // FIX: was 10ms → now 2ms
+    delay(2);
   }
   float avg     = sum / (float)samples;
   float voltage = avg * 3.3 / 4095.0;
@@ -94,14 +116,14 @@ float readPH() {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// SOIL — reduced delay: 20×2ms = 40ms (was 20×5ms = 100ms)
+// SOIL
 // ═══════════════════════════════════════════════════════════════
 int readSoil() {
   const int samples = 20;
   long sum = 0;
   for (int i = 0; i < samples; i++) {
     sum += analogRead(SOIL_PIN);
-    delay(2);                  // FIX: was 5ms → now 2ms
+    delay(2);
   }
   float avg = sum / (float)samples;
   int pct = map((int)avg, SOIL_DRY, SOIL_WET, 0, 100);
@@ -110,8 +132,6 @@ int readSoil() {
 
 // ═══════════════════════════════════════════════════════════════
 // RECEIVE LORA
-// Called from loop() AND from inside sendData() at every
-// blocking boundary so no packet is missed.
 // ═══════════════════════════════════════════════════════════════
 void receiveLoRa() {
   int packetSize = LoRa.parsePacket();
@@ -127,7 +147,6 @@ void receiveLoRa() {
   Serial.println(msg);
   Serial.println("══════════════════════");
 
-  // Filter by device ID
   if (msg.indexOf("\"id\":\"abdellah\"") == -1) return;
 
   // ── Main pump (ACTIVE LOW relay) ──
@@ -156,53 +175,43 @@ void receiveLoRa() {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// SETUP
+// DEEP SLEEP HELPERS
 // ═══════════════════════════════════════════════════════════════
-void setup() {
-  Serial.begin(115200);
-  delay(500);
-
-  pinMode(RELAY_PIN,  OUTPUT);
-  pinMode(RELAY2_PIN, OUTPUT);
-  digitalWrite(RELAY_PIN,  HIGH);  // pump OFF (active low)
-  digitalWrite(RELAY2_PIN, LOW);   // drain pump OFF (active high)
-
-  scale.begin(DOUT, CLK);
-  scale.set_scale(CALIBRATION_FACTOR);
-  scale.tare();
-
-  pinMode(SOIL_PIN,  INPUT);
-  pinMode(FLOW1_PIN, INPUT_PULLUP);
-  pinMode(FLOW2_PIN, INPUT_PULLUP);
-
-  attachInterrupt(digitalPinToInterrupt(FLOW1_PIN), flow1ISR, RISING);
-  attachInterrupt(digitalPinToInterrupt(FLOW2_PIN), flow2ISR, RISING);
-
-  LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
-  if (!LoRa.begin(LORA_BAND)) {
-    Serial.println("LoRa init failed!");
-    while (true);
+void printWakeupReason() {
+  esp_sleep_wakeup_cause_t reason = esp_sleep_get_wakeup_cause();
+  switch (reason) {
+    case ESP_SLEEP_WAKEUP_TIMER:
+      Serial.println(" Woke up from deep sleep (timer, repos mode)");
+      break;
+    default:
+      Serial.println(" Cold boot / power-on");
+      break;
   }
+}
 
-  LoRa.setSpreadingFactor(7);
-  LoRa.setSignalBandwidth(125E3);
-  LoRa.setCodingRate4(5);
-  LoRa.setSyncWord(0x12);
-
-  Serial.println("ESP32 ready.");
+// Only called when pump AND drain_pump are OFF (repos time).
+// Never returns — the chip restarts from setup() on wake-up.
+void goToDeepSleep() {
+  Serial.println("💤 Repos mode: pump OFF — entering deep sleep for 5 minutes");
+  Serial.flush();
+  esp_sleep_enable_timer_wakeup(SLEEP_INTERVAL_US);
+  esp_deep_sleep_start();
 }
 
 // ═══════════════════════════════════════════════════════════════
 // SEND DATA
-// receiveLoRa() is called at every slow/blocking boundary so
-// incoming commands are never missed during a 30s send cycle.
 // ═══════════════════════════════════════════════════════════════
 void sendData() {
 
   // ── 1. Weight (HX711 ~500ms blocking) ──
   receiveLoRa();
-  float weight_g = scale.get_units(5) * 1000.0;
-  if (weight_g < 0) weight_g = 0;
+  float weight_g = 0;
+  if (scale.is_ready()) {
+    weight_g = scale.get_units(5) * 1000.0;
+    if (weight_g < 0) weight_g = 0;
+  } else {
+    Serial.println(" HX711 not ready — skipping weight");
+  }
 
   // ── 2. Soil (~40ms blocking) ──
   receiveLoRa();
@@ -229,7 +238,7 @@ void sendData() {
     long sum = 0;
     for (int i = 0; i < samples; i++) {
       sum += analogRead(EC_PIN);
-      delay(2);                // FIX: was 10ms → now 2ms
+      delay(2);
     }
     float avg      = sum / (float)samples;
     float voltage  = avg * 3.3 / 4095.0;
@@ -270,15 +279,87 @@ void sendData() {
 }
 
 // ═══════════════════════════════════════════════════════════════
+// SETUP
+// Runs on every cold boot AND every deep-sleep wake-up.
+// ═══════════════════════════════════════════════════════════════
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  bootCount++;
+  Serial.println("Boot count: " + String(bootCount));
+  printWakeupReason();
+
+  pinMode(RELAY_PIN,  OUTPUT);
+  pinMode(RELAY2_PIN, OUTPUT);
+  // Restore relay outputs to match the persisted state
+  // (deep sleep resets GPIOs, so we must re-apply them).
+  digitalWrite(RELAY_PIN,  pumpState      ? LOW  : HIGH); // active low
+  digitalWrite(RELAY2_PIN, drainPumpState ? HIGH : LOW);  // active high
+
+  scale.begin(DOUT, CLK);
+  scale.set_scale(CALIBRATION_FACTOR);
+  scale.tare();
+
+  pinMode(SOIL_PIN,  INPUT);
+  pinMode(FLOW1_PIN, INPUT_PULLUP);
+  pinMode(FLOW2_PIN, INPUT_PULLUP);
+
+  attachInterrupt(digitalPinToInterrupt(FLOW1_PIN), flow1ISR, RISING);
+  attachInterrupt(digitalPinToInterrupt(FLOW2_PIN), flow2ISR, RISING);
+
+  LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
+  if (!LoRa.begin(LORA_BAND)) {
+    Serial.println("LoRa init failed!");
+    while (true);
+  }
+
+  LoRa.setSpreadingFactor(7);
+  LoRa.setSignalBandwidth(125E3);
+  LoRa.setCodingRate4(5);
+  LoRa.setSyncWord(0x12);
+
+  Serial.println("ESP32 ready.");
+
+  // ── Short listen window right after wake-up ──
+  // Catches a command that might arrive just as we wake, since
+  // the radio was completely off during deep sleep.
+  unsigned long listenStart = millis();
+  while (millis() - listenStart < LISTEN_WINDOW_MS) {
+    receiveLoRa();
+    delay(10);
+  }
+
+  // Send one telemetry packet immediately (also true for cold boot).
+  lastSend = millis();
+  sendData();
+
+  // ── Decide: stay awake (irrigation active) or go back to sleep (repos) ──
+  if (!pumpState && !drainPumpState) {
+    goToDeepSleep(); // never returns — chip restarts on next wake
+  }
+  // else: pump is ON -> fall through into loop() and stay fully awake
+}
+
+// ═══════════════════════════════════════════════════════════════
 // LOOP
+// Only reached while pump (or drain_pump) is ON — i.e. irrigation
+// is active. Behaves exactly like the original always-on version:
+// continuous LoRa listening + telemetry every 30s.
 // ═══════════════════════════════════════════════════════════════
 void loop() {
   receiveLoRa();
 
   if (millis() - lastSend >= SEND_INTERVAL_MS) {
-    lastSend = millis();   // FIX: set BEFORE sendData() so a slow
-    sendData();            //      read never causes double-fire
+    lastSend = millis();   // set BEFORE sendData() so a slow
+    sendData();            // read never causes double-fire
+
+    // Pump may have just been turned OFF during sendData()'s
+    // receiveLoRa() calls -> switch to repos/deep-sleep mode.
+    if (!pumpState && !drainPumpState) {
+      goToDeepSleep();
+    }
   }
 
-  delay(10);               // FIX: was 50ms → 10ms for faster polling
+  delay(10);
 }
